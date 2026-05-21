@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { 
   BookOpen, Search, Loader2, Check, Copy, Download, 
   ChevronDown, ChevronUp, FileText, AlertCircle, RotateCw,
@@ -10,41 +10,99 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Textarea } from '@/components/ui/textarea';
-import { searchArticles } from './services/pubmed';
-import type { PubMedArticle } from './services/pubmed';
-import { generateReview } from './services/review';
-import type { ReviewResult } from './services/review';
+import { trpc } from '@/providers/trpc';
+
+interface Article {
+  uid: string;
+  pmid: string;
+  title: string;
+  authors: string[];
+  journal: string;
+  year: string;
+  abstract: string;
+  url: string;
+  selected?: boolean;
+}
+
+interface ReviewSection {
+  title: string;
+  content: string;
+}
+
+interface ReviewResult {
+  title: string;
+  abstract: string;
+  sections: ReviewSection[];
+  references: string[];
+  fullText: string;
+  isAiGenerated?: boolean;
+}
 
 type AppState = 'idle' | 'searching' | 'selecting' | 'generating' | 'review' | 'editing' | 'error';
 
 function App() {
   const [topic, setTopic] = useState('');
   const [appState, setAppState] = useState<AppState>('idle');
-  const [articles, setArticles] = useState<PubMedArticle[]>([]);
+  const [articles, setArticles] = useState<Article[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [searchId, setSearchId] = useState<number | null>(null);
   const [review, setReview] = useState<ReviewResult | null>(null);
   const [error, setError] = useState('');
   const [editText, setEditText] = useState('');
   const [copied, setCopied] = useState(false);
   const [expandedAbstracts, setExpandedAbstracts] = useState<Set<string>>(new Set());
-  const [isOffline, setIsOffline] = useState(false);
   const reviewRef = useRef<HTMLDivElement>(null);
-  const editRef = useRef<HTMLDivElement>(null);
 
-  // 检查网络状态
-  useEffect(() => {
-    setIsOffline(!navigator.onLine);
-    const handleOnline = () => setIsOffline(false);
-    const handleOffline = () => setIsOffline(true);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, []);
+  // tRPC mutations
+  const searchMutation = trpc.pubmed.search.useMutation({
+    onSuccess: (data) => {
+      if (data.searchId === null) {
+        setError('未找到相关文献，请尝试更换关键词或检查拼写。');
+        setAppState('error');
+        return;
+      }
+      setSearchId(data.searchId);
+      const mappedArticles = data.articles.map((a) => ({
+        uid: a.pmid,
+        pmid: a.pmid,
+        title: a.title,
+        authors: a.authors,
+        journal: a.journal,
+        year: a.year,
+        abstract: a.abstract,
+        url: a.url,
+        selected: true,
+      }));
+      setArticles(mappedArticles);
+      setSelectedIds(new Set(mappedArticles.map((a) => a.uid)));
+      setAppState('selecting');
+    },
+    onError: (err) => {
+      setError(`文献检索失败: ${err.message}`);
+      setAppState('error');
+    },
+  });
 
-  // 自动滚动到结果区
+  const generateMutation = trpc.review.generate.useMutation({
+    onSuccess: (data) => {
+      setReview({
+        title: data.title,
+        abstract: data.abstract,
+        sections: data.sections,
+        references: data.references,
+        fullText: data.fullText,
+        isAiGenerated: data.isAiGenerated,
+      });
+      setEditText(data.fullText);
+      setAppState('review');
+    },
+    onError: (err) => {
+      setError(`综述生成失败: ${err.message}`);
+      setAppState('selecting');
+    },
+  });
+
+  // Auto scroll
   useEffect(() => {
     if ((appState === 'selecting' || appState === 'review') && reviewRef.current) {
       setTimeout(() => {
@@ -53,93 +111,56 @@ function App() {
     }
   }, [appState]);
 
-  // 开始检索
-  const handleSearch = useCallback(async () => {
+  // Search handler
+  const handleSearch = useCallback(() => {
     if (!topic.trim()) return;
-    
     setAppState('searching');
     setError('');
     setArticles([]);
     setSelectedIds(new Set());
     setReview(null);
-    
-    try {
-      const results = await searchArticles(topic.trim(), 15);
-      
-      if (results.length === 0) {
-        setError('未找到相关文献，请尝试更换关键词或检查拼写。');
-        setAppState('error');
-        return;
-      }
-      
-      setArticles(results);
-      // 默认全选
-      setSelectedIds(new Set(results.map(a => a.uid)));
-      setAppState('selecting');
-    } catch (err) {
-      setError('文献检索失败，可能是网络问题。请检查网络连接后重试。');
-      setAppState('error');
-      console.error(err);
-    }
-  }, [topic]);
+    setSearchId(null);
+    searchMutation.mutate({ topic: topic.trim(), maxResults: 15 });
+  }, [topic, searchMutation]);
 
-  // 切换文献选择
+  // Toggle selection
   const toggleSelection = useCallback((uid: string) => {
-    setSelectedIds(prev => {
+    setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(uid)) {
-        next.delete(uid);
-      } else {
-        next.add(uid);
-      }
+      if (next.has(uid)) next.delete(uid);
+      else next.add(uid);
       return next;
     });
   }, []);
 
-  // 全选/取消全选
   const toggleSelectAll = useCallback(() => {
     if (selectedIds.size === articles.length) {
       setSelectedIds(new Set());
     } else {
-      setSelectedIds(new Set(articles.map(a => a.uid)));
+      setSelectedIds(new Set(articles.map((a) => a.uid)));
     }
   }, [selectedIds.size, articles]);
 
-  // 生成综述
-  const handleGenerateReview = useCallback(async () => {
-    if (selectedIds.size === 0) return;
-    
-    const selectedArticles = articles.filter(a => selectedIds.has(a.uid)).map(a => ({
-      title: a.title,
-      authors: a.authors,
-      journal: a.journal,
-      year: a.year,
-      abstract: a.abstract,
-      pmid: a.pmid,
-    }));
-    
+  // Generate review
+  const handleGenerateReview = useCallback(() => {
+    if (selectedIds.size === 0 || !searchId) return;
     setAppState('generating');
     setError('');
-    
-    try {
-      const result = await generateReview(topic, selectedArticles);
-      setReview(result);
-      setEditText(result.fullText);
-      setAppState('review');
-    } catch (err) {
-      setError('综述生成失败，请重试。');
-      setAppState('selecting');
-      console.error(err);
-    }
-  }, [selectedIds, articles, topic]);
+    generateMutation.mutate({ searchId });
+  }, [selectedIds, searchId, generateMutation]);
 
-  // 重新检索
+  // Retry
   const handleRetry = useCallback(() => {
     setAppState('idle');
     setError('');
+    setTopic('');
+    setArticles([]);
+    setSelectedIds(new Set());
+    setReview(null);
+    setSearchId(null);
   }, []);
 
-  // 复制全文
+  // Copy
   const handleCopy = useCallback(async () => {
     const textToCopy = appState === 'editing' ? editText : review?.fullText || '';
     try {
@@ -147,7 +168,6 @@ function App() {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // 降级方案
       const textarea = document.createElement('textarea');
       textarea.value = textToCopy;
       document.body.appendChild(textarea);
@@ -159,7 +179,7 @@ function App() {
     }
   }, [appState, editText, review]);
 
-  // 导出Markdown
+  // Export
   const handleExport = useCallback(() => {
     const content = appState === 'editing' ? editText : review?.fullText || '';
     const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
@@ -173,10 +193,10 @@ function App() {
     URL.revokeObjectURL(url);
   }, [appState, editText, review, topic]);
 
-  // 切换编辑模式
+  // Toggle edit
   const toggleEditMode = useCallback(() => {
     if (appState === 'editing') {
-      setReview(prev => prev ? { ...prev, fullText: editText } : null);
+      setReview((prev) => (prev ? { ...prev, fullText: editText } : null));
       setAppState('review');
     } else {
       setEditText(review?.fullText || '');
@@ -184,23 +204,20 @@ function App() {
     }
   }, [appState, editText, review]);
 
-  // 展开/收起摘要
+  // Toggle abstract
   const toggleAbstract = useCallback((uid: string) => {
-    setExpandedAbstracts(prev => {
+    setExpandedAbstracts((prev) => {
       const next = new Set(prev);
-      if (next.has(uid)) {
-        next.delete(uid);
-      } else {
-        next.add(uid);
-      }
+      if (next.has(uid)) next.delete(uid);
+      else next.add(uid);
       return next;
     });
   }, []);
 
-  // 骨架屏渲染
+  // Skeletons
   const renderSkeletons = () => (
     <div className="space-y-4 animate-pulse">
-      {[1, 2, 3, 4, 5].map(i => (
+      {[1, 2, 3, 4, 5].map((i) => (
         <div key={i} className="bg-white border border-gray-100 rounded-xl p-5">
           <div className="flex items-start gap-3">
             <div className="w-4 h-4 rounded bg-gray-200 mt-1 flex-shrink-0" />
@@ -217,20 +234,19 @@ function App() {
 
   return (
     <div className="min-h-screen bg-white">
-      {/* 顶部导航 */}
+      {/* Navbar */}
       <nav className="fixed top-0 left-0 right-0 z-50 bg-white/85 backdrop-blur-xl border-b border-gray-200">
         <div className="max-w-[960px] mx-auto px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <BookOpen className="w-5 h-5 text-blue-600" />
             <span className="font-semibold text-[#1A1A2E]">文献综述助手</span>
           </div>
-          <span className="text-sm text-gray-400">极简版</span>
+          <span className="text-sm text-gray-400">后端版</span>
         </div>
       </nav>
 
-      {/* 主体内容 */}
       <main className="pt-14">
-        {/* Hero区域 */}
+        {/* Hero */}
         <section className="min-h-[60vh] flex flex-col items-center justify-center px-4 py-16">
           <div className="text-center mb-10">
             <h1 className="text-4xl md:text-5xl font-bold text-[#1A1A2E] mb-4 tracking-tight">
@@ -239,16 +255,19 @@ function App() {
             <p className="text-gray-500 text-lg max-w-lg mx-auto leading-relaxed">
               输入研究主题，AI自动检索PubMed文献并生成学术综述
             </p>
+            <p className="text-gray-400 text-sm mt-2">
+              后端版 · 数据持久化 · 支持真实DeepSeek AI
+            </p>
           </div>
 
-          {/* 输入区域 */}
+          {/* Input */}
           <div className="w-full max-w-2xl">
             <div className="flex gap-2">
               <Input
                 placeholder="输入研究主题，如：lung cancer immunotherapy"
                 value={topic}
-                onChange={e => setTopic(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleSearch()}
+                onChange={(e) => setTopic(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
                 disabled={appState === 'searching'}
                 className="flex-1 h-14 text-lg px-5 border-gray-200 focus:border-blue-600 focus:ring-blue-200 transition-all"
               />
@@ -267,19 +286,9 @@ function App() {
                 )}
               </Button>
             </div>
-            
-            {/* 离线提示 */}
-            {isOffline && (
-              <Alert className="mt-4 bg-amber-50 border-amber-200">
-                <AlertCircle className="w-4 h-4 text-amber-600" />
-                <AlertDescription className="text-amber-700 text-sm">
-                  当前处于离线状态，请连接网络后使用。
-                </AlertDescription>
-              </Alert>
-            )}
           </div>
 
-          {/* 推荐主题 */}
+          {/* Quick topics */}
           {appState === 'idle' && (
             <div className="mt-8 flex flex-wrap gap-2 justify-center max-w-lg">
               <span className="text-sm text-gray-400">热门主题：</span>
@@ -289,10 +298,10 @@ function App() {
                 'diabetes treatment',
                 'gene therapy',
                 'CRISPR',
-              ].map(t => (
+              ].map((t) => (
                 <button
                   key={t}
-                  onClick={() => { setTopic(t); }}
+                  onClick={() => setTopic(t)}
                   className="text-sm px-3 py-1.5 rounded-full bg-gray-50 text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-colors"
                 >
                   {t}
@@ -302,7 +311,7 @@ function App() {
           )}
         </section>
 
-        {/* 错误提示 */}
+        {/* Error */}
         {appState === 'error' && error && (
           <section className="px-4 pb-8">
             <div className="max-w-3xl mx-auto">
@@ -311,12 +320,7 @@ function App() {
                 <AlertDescription className="text-red-700 flex-1">
                   {error}
                 </AlertDescription>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleRetry}
-                  className="ml-2"
-                >
+                <Button variant="outline" size="sm" onClick={handleRetry} className="ml-2">
                   <RotateCw className="w-4 h-4 mr-1" />
                   重试
                 </Button>
@@ -325,11 +329,10 @@ function App() {
           </section>
         )}
 
-        {/* 文献检索结果 */}
+        {/* Articles */}
         {(appState === 'searching' || appState === 'selecting' || appState === 'generating') && (
           <section className="px-4 pb-16" ref={reviewRef}>
             <div className="max-w-3xl mx-auto">
-              {/* 状态标题 */}
               <div className="flex items-center gap-3 mb-6">
                 <FileText className="w-5 h-5 text-blue-600" />
                 <h2 className="text-xl font-semibold text-[#1A1A2E]">
@@ -342,12 +345,10 @@ function App() {
                 )}
               </div>
 
-              {/* 骨架屏 or 文献列表 */}
               {appState === 'searching' ? (
                 renderSkeletons()
               ) : (
                 <>
-                  {/* 全选按钮 */}
                   <div className="flex items-center justify-between mb-4">
                     <label className="flex items-center gap-2 cursor-pointer select-none">
                       <Checkbox
@@ -373,12 +374,11 @@ function App() {
                     </Button>
                   </div>
 
-                  {/* 文献卡片列表 */}
                   <div className="space-y-3">
                     {articles.map((article, index) => (
                       <div
                         key={article.uid}
-                        className="bg-white border border-gray-100 rounded-xl p-5 hover:border-blue-200 transition-all hover:shadow-sm"
+                        className="bg-white border border-gray-100 rounded-xl p-5 hover:border-blue-200 transition-all hover:shadow-sm relative"
                       >
                         <div className="flex items-start gap-3">
                           <div className="pt-0.5">
@@ -389,15 +389,14 @@ function App() {
                             />
                           </div>
                           <div className="flex-1 min-w-0">
-                            {/* 标题 */}
-                            <h3 className="font-medium text-blue-600 hover:underline cursor-pointer mb-1.5 leading-snug"
+                            <h3
+                              className="font-medium text-blue-600 hover:underline cursor-pointer mb-1.5 leading-snug"
                               onClick={() => window.open(article.url, '_blank')}
                             >
                               {article.title}
                               <ExternalLink className="w-3 h-3 inline ml-1 opacity-50" />
                             </h3>
-                            
-                            {/* 作者、期刊、年份 */}
+
                             <p className="text-sm text-gray-500 mb-2">
                               {article.authors.length > 0 ? `${article.authors.join(', ')} 等 · ` : ''}
                               <span className="text-gray-600">{article.journal}</span>
@@ -405,7 +404,6 @@ function App() {
                               <span className="text-gray-400">{article.year}</span>
                             </p>
 
-                            {/* 摘要（可展开） */}
                             {article.abstract && (
                               <div className="mt-2">
                                 {expandedAbstracts.has(article.uid) ? (
@@ -438,7 +436,6 @@ function App() {
                               </div>
                             )}
 
-                            {/* 序号标签 */}
                             <span className="absolute top-4 right-4 text-xs text-gray-300 font-mono">
                               [{index + 1}]
                             </span>
@@ -453,22 +450,30 @@ function App() {
           </section>
         )}
 
-        {/* 综述展示与编辑 */}
+        {/* Review */}
         {(appState === 'review' || appState === 'editing') && review && (
-          <section className="px-4 pb-16" ref={editRef}>
+          <section className="px-4 pb-16">
             <div className="max-w-3xl mx-auto">
-              {/* 综述标题 */}
               <div className="mb-6">
                 <div className="flex items-center gap-2 mb-3">
                   <Sparkles className="w-5 h-5 text-blue-600" />
                   <h2 className="text-xl font-semibold text-[#1A1A2E]">AI生成综述</h2>
+                  {review.isAiGenerated && (
+                    <span className="px-2 py-0.5 text-xs bg-blue-50 text-blue-600 rounded-full font-medium">
+                      DeepSeek AI
+                    </span>
+                  )}
+                  {!review.isAiGenerated && (
+                    <span className="px-2 py-0.5 text-xs bg-gray-100 text-gray-500 rounded-full font-medium">
+                      本地生成
+                    </span>
+                  )}
                 </div>
                 <h1 className="text-2xl font-bold text-[#1A1A2E] leading-snug">
                   {review.title}
                 </h1>
               </div>
 
-              {/* 操作栏 */}
               <div className="flex flex-wrap items-center gap-2 mb-6 p-4 bg-gray-50 rounded-xl border border-gray-100">
                 <Button
                   variant={appState === 'editing' ? 'default' : 'outline'}
@@ -479,12 +484,7 @@ function App() {
                   <FileText className="w-4 h-4 mr-1.5" />
                   {appState === 'editing' ? '完成编辑' : '编辑模式'}
                 </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCopy}
-                  className="border-gray-200"
-                >
+                <Button variant="outline" size="sm" onClick={handleCopy} className="border-gray-200">
                   {copied ? (
                     <Check className="w-4 h-4 mr-1.5 text-green-600" />
                   ) : (
@@ -492,44 +492,30 @@ function App() {
                   )}
                   {copied ? '已复制' : '复制全文'}
                 </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleExport}
-                  className="border-gray-200"
-                >
+                <Button variant="outline" size="sm" onClick={handleExport} className="border-gray-200">
                   <Download className="w-4 h-4 mr-1.5" />
                   导出Markdown
                 </Button>
                 <div className="flex-1" />
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleRetry}
-                  className="border-gray-200 text-gray-500"
-                >
+                <Button variant="outline" size="sm" onClick={handleRetry} className="border-gray-200 text-gray-500">
                   <RotateCw className="w-4 h-4 mr-1.5" />
                   重新检索
                 </Button>
               </div>
 
-              {/* 编辑模式 */}
               {appState === 'editing' ? (
                 <Textarea
                   value={editText}
-                  onChange={e => setEditText(e.target.value)}
+                  onChange={(e) => setEditText(e.target.value)}
                   className="min-h-[600px] font-mono text-sm leading-relaxed p-5 border-gray-200 focus:border-blue-600 focus:ring-blue-200 resize-y"
                 />
               ) : (
-                /* 预览模式 */
                 <div className="bg-white border border-gray-100 rounded-xl p-6 md:p-8 space-y-6">
-                  {/* 摘要 */}
                   <div>
                     <h3 className="text-lg font-semibold text-[#1A1A2E] mb-3">摘要</h3>
                     <p className="text-gray-700 leading-relaxed">{review.abstract}</p>
                   </div>
 
-                  {/* 正文 */}
                   {review.sections.map((section, i) => (
                     <div key={i}>
                       <h3 className="text-lg font-semibold text-[#1A1A2E] mb-3">
@@ -541,7 +527,6 @@ function App() {
                     </div>
                   ))}
 
-                  {/* 参考文献 */}
                   <div className="pt-4 border-t border-gray-100">
                     <h3 className="text-lg font-semibold text-[#1A1A2E] mb-4">参考文献</h3>
                     <ol className="space-y-2">
@@ -560,10 +545,11 @@ function App() {
         )}
       </main>
 
-      {/* 底部 */}
+      {/* Footer */}
       <footer className="border-t border-gray-100 py-6 px-4">
-        <div className="max-w-3xl mx-auto text-center text-sm text-gray-400">
+        <div className="max-w-3xl mx-auto text-center text-sm text-gray-400 space-y-1">
           <p>文献数据来源于 PubMed 数据库 · 综述内容由 AI 辅助生成，仅供参考</p>
+          <p className="text-xs">后端驱动：tRPC + Drizzle ORM + Hono + MySQL</p>
         </div>
       </footer>
     </div>
