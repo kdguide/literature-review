@@ -1,8 +1,8 @@
 # 文献综述助手 - Railway Nixpacks 配置
-# 从源码构建，不依赖 Dockerfile
+# 迁移文件已预生成在 db/migrations/，无需在构建时生成
 
 [phases.build]
-cmds = ["npm install", "npm run build", "npm run db:generate"]
+cmds = ["npm install", "npm run build"]
 
 [phases.setup]
 nixPkgs = ["nodejs_20"]
