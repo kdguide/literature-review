@@ -235,11 +235,11 @@ export const pubmedRouter = createRouter({
 
         // 4. Save to database
         const db = getDb();
-        const [searchRecord] = await db
+        const searchResult = await db
           .insert(searches)
           .values({ topic })
-          .$returningId();
-        const searchId = searchRecord.id;
+          .returning({ id: searches.id });
+        const searchId = searchResult[0].id;
 
         // Insert articles
         await db.insert(articles).values(
