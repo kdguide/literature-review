@@ -1,11 +1,11 @@
-# Railway Nixpacks 配置
-# 文献综述助手 - 全栈部署
+# 文献综述助手 - Railway Nixpacks 配置
+# 从源码构建，不依赖 Dockerfile
 
 [phases.build]
-cmds = ["npm install", "npm run build"]
+cmds = ["npm install", "npm run build", "npm run db:generate"]
 
 [phases.setup]
 nixPkgs = ["nodejs_20"]
 
 [start]
-cmd = "npm start"
+cmd = "npm run db:migrate && npm start"
