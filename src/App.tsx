@@ -106,7 +106,7 @@ function App() {
       try {
         const data = await searchMutation.mutateAsync({
           topic: topic.trim(),
-          maxResults: 15,
+          maxResults: 100,
         });
         if (data.searchId === null) {
           setError('未找到相关文献，请尝试更换关键词或检查拼写。');

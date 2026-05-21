@@ -97,7 +97,7 @@ export interface PubMedArticle {
  */
 async function searchPubMedIds(
   keyword: string,
-  maxResults: number = 15
+  maxResults: number = 100
 ): Promise<string[]> {
   const url = `${PUBMED_BASE}/esearch.fcgi?db=pubmed&term=${encodeURIComponent(
     keyword
@@ -202,7 +202,7 @@ export const pubmedRouter = createRouter({
     .input(
       z.object({
         topic: z.string().min(1).max(500),
-        maxResults: z.number().min(1).max(30).optional().default(15),
+        maxResults: z.number().min(1).max(100).optional().default(100),
       })
     )
     .mutation(async ({ input }) => {

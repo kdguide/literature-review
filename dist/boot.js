@@ -27014,7 +27014,7 @@ async function fetchWithRetry(url2, options, retries = MAX_RETRIES) {
     throw lastError || new Error("All requests failed");
   }
 }
-async function searchPubMedIds(keyword, maxResults = 15) {
+async function searchPubMedIds(keyword, maxResults = 100) {
   const url2 = `${PUBMED_BASE}/esearch.fcgi?db=pubmed&term=${encodeURIComponent(
     keyword
   )}&retmax=${maxResults}&retmode=json&sort=relevance`;
@@ -27076,7 +27076,7 @@ var pubmedRouter = createRouter({
   search: publicQuery.input(
     external_exports.object({
       topic: external_exports.string().min(1).max(500),
-      maxResults: external_exports.number().min(1).max(30).optional().default(15)
+      maxResults: external_exports.number().min(1).max(100).optional().default(100)
     })
   ).mutation(async ({ input }) => {
     try {
