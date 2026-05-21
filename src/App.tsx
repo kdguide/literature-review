@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { 
   BookOpen, Search, Loader2, Check, Copy, Download, 
   ChevronDown, ChevronUp, FileText, AlertCircle, RotateCw,
-  Sparkles, ExternalLink
+  Sparkles, ExternalLink, ServerOff
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -11,6 +11,8 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Textarea } from '@/components/ui/textarea';
 import { trpc } from '@/providers/trpc';
+import { searchArticles as frontendSearch } from './services/pubmed';
+import { generateReview as frontendGenerate } from './services/review';
 
 interface Article {
   uid: string;
@@ -40,6 +42,22 @@ interface ReviewResult {
 
 type AppState = 'idle' | 'searching' | 'selecting' | 'generating' | 'review' | 'editing' | 'error';
 
+// Check if error indicates backend is unavailable (HTML response, 404, network error)
+function isBackendUnavailable(err: Error): boolean {
+  const msg = err.message || '';
+  return (
+    msg.includes('DOCTYPE') ||
+    msg.includes('<!DOCTYPE') ||
+    msg.includes('<html') ||
+    msg.includes('Unexpected token') ||
+    msg.includes('Failed to fetch') ||
+    msg.includes('Network') ||
+    msg.includes('404') ||
+    msg.includes('Only absolute URLs') ||
+    msg.includes('fetch') && msg.includes('failed')
+  );
+}
+
 function App() {
   const [topic, setTopic] = useState('');
   const [appState, setAppState] = useState<AppState>('idle');
@@ -51,55 +69,17 @@ function App() {
   const [editText, setEditText] = useState('');
   const [copied, setCopied] = useState(false);
   const [expandedAbstracts, setExpandedAbstracts] = useState<Set<string>>(new Set());
+  const [useBackend, setUseBackend] = useState(true); // true = try backend first
+  const [showBackendNotice, setShowBackendNotice] = useState(false);
   const reviewRef = useRef<HTMLDivElement>(null);
 
-  // tRPC mutations
+  // tRPC mutations (backend)
   const searchMutation = trpc.pubmed.search.useMutation({
-    onSuccess: (data) => {
-      if (data.searchId === null) {
-        setError('未找到相关文献，请尝试更换关键词或检查拼写。');
-        setAppState('error');
-        return;
-      }
-      setSearchId(data.searchId);
-      const mappedArticles = data.articles.map((a) => ({
-        uid: a.pmid,
-        pmid: a.pmid,
-        title: a.title,
-        authors: a.authors,
-        journal: a.journal,
-        year: a.year,
-        abstract: a.abstract,
-        url: a.url,
-        selected: true,
-      }));
-      setArticles(mappedArticles);
-      setSelectedIds(new Set(mappedArticles.map((a) => a.uid)));
-      setAppState('selecting');
-    },
-    onError: (err) => {
-      setError(`文献检索失败: ${err.message}`);
-      setAppState('error');
-    },
+    retry: false,
   });
 
   const generateMutation = trpc.review.generate.useMutation({
-    onSuccess: (data) => {
-      setReview({
-        title: data.title,
-        abstract: data.abstract,
-        sections: data.sections,
-        references: data.references,
-        fullText: data.fullText,
-        isAiGenerated: data.isAiGenerated,
-      });
-      setEditText(data.fullText);
-      setAppState('review');
-    },
-    onError: (err) => {
-      setError(`综述生成失败: ${err.message}`);
-      setAppState('selecting');
-    },
+    retry: false,
   });
 
   // Auto scroll
@@ -111,8 +91,8 @@ function App() {
     }
   }, [appState]);
 
-  // Search handler
-  const handleSearch = useCallback(() => {
+  // ===== Search: try backend → fallback to frontend =====
+  const handleSearch = useCallback(async () => {
     if (!topic.trim()) return;
     setAppState('searching');
     setError('');
@@ -120,8 +100,122 @@ function App() {
     setSelectedIds(new Set());
     setReview(null);
     setSearchId(null);
-    searchMutation.mutate({ topic: topic.trim(), maxResults: 15 });
-  }, [topic, searchMutation]);
+    setShowBackendNotice(false);
+
+    if (useBackend) {
+      try {
+        const data = await searchMutation.mutateAsync({
+          topic: topic.trim(),
+          maxResults: 15,
+        });
+        if (data.searchId === null) {
+          setError('未找到相关文献，请尝试更换关键词或检查拼写。');
+          setAppState('error');
+          return;
+        }
+        setSearchId(data.searchId);
+        const mapped = data.articles.map((a) => ({
+          uid: a.pmid,
+          pmid: a.pmid,
+          title: a.title,
+          authors: a.authors,
+          journal: a.journal,
+          year: a.year,
+          abstract: a.abstract,
+          url: a.url,
+          selected: true,
+        }));
+        setArticles(mapped);
+        setSelectedIds(new Set(mapped.map((a) => a.uid)));
+        setAppState('selecting');
+        return;
+      } catch (err: unknown) {
+        const e = err as Error;
+        if (isBackendUnavailable(e)) {
+          // Backend not available, switch to frontend mode
+          setUseBackend(false);
+          setShowBackendNotice(true);
+        } else {
+          setError(`文献检索失败: ${e.message}`);
+          setAppState('error');
+          return;
+        }
+      }
+    }
+
+    // Frontend fallback
+    try {
+      const results = await frontendSearch(topic.trim(), 15);
+      if (results.length === 0) {
+        setError('未找到相关文献，请尝试更换关键词或检查拼写。');
+        setAppState('error');
+        return;
+      }
+      const mapped = results.map((a) => ({ ...a, selected: true }));
+      setArticles(mapped);
+      setSelectedIds(new Set(mapped.map((a) => a.uid)));
+      setAppState('selecting');
+    } catch (err: unknown) {
+      setError(`文献检索失败: ${(err as Error).message}，请检查网络连接。`);
+      setAppState('error');
+    }
+  }, [topic, useBackend, searchMutation]);
+
+  // ===== Generate Review: try backend → fallback to frontend =====
+  const handleGenerateReview = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+    setAppState('generating');
+    setError('');
+
+    const selectedArticles = articles.filter((a) => selectedIds.has(a.uid));
+
+    if (useBackend && searchId) {
+      try {
+        const data = await generateMutation.mutateAsync({ searchId });
+        setReview({
+          title: data.title,
+          abstract: data.abstract,
+          sections: data.sections,
+          references: data.references,
+          fullText: data.fullText,
+          isAiGenerated: data.isAiGenerated,
+        });
+        setEditText(data.fullText);
+        setAppState('review');
+        return;
+      } catch (err: unknown) {
+        const e = err as Error;
+        if (isBackendUnavailable(e)) {
+          setUseBackend(false);
+          setShowBackendNotice(true);
+        } else {
+          setError(`综述生成失败: ${e.message}`);
+          setAppState('selecting');
+          return;
+        }
+      }
+    }
+
+    // Frontend fallback
+    try {
+      const result = await frontendGenerate(
+        topic,
+        selectedArticles.map((a) => ({
+          title: a.title,
+          authors: a.authors,
+          journal: a.journal,
+          year: a.year,
+          abstract: a.abstract,
+        }))
+      );
+      setReview({ ...result, isAiGenerated: false });
+      setEditText(result.fullText);
+      setAppState('review');
+    } catch (err: unknown) {
+      setError(`综述生成失败: ${(err as Error).message}`);
+      setAppState('selecting');
+    }
+  }, [selectedIds, articles, useBackend, searchId, generateMutation, topic]);
 
   // Toggle selection
   const toggleSelection = useCallback((uid: string) => {
@@ -141,14 +235,6 @@ function App() {
     }
   }, [selectedIds.size, articles]);
 
-  // Generate review
-  const handleGenerateReview = useCallback(() => {
-    if (selectedIds.size === 0 || !searchId) return;
-    setAppState('generating');
-    setError('');
-    generateMutation.mutate({ searchId });
-  }, [selectedIds, searchId, generateMutation]);
-
   // Retry
   const handleRetry = useCallback(() => {
     setAppState('idle');
@@ -158,6 +244,8 @@ function App() {
     setSelectedIds(new Set());
     setReview(null);
     setSearchId(null);
+    setUseBackend(true);
+    setShowBackendNotice(false);
   }, []);
 
   // Copy
@@ -241,7 +329,7 @@ function App() {
             <BookOpen className="w-5 h-5 text-blue-600" />
             <span className="font-semibold text-[#1A1A2E]">文献综述助手</span>
           </div>
-          <span className="text-sm text-gray-400">后端版</span>
+          <span className="text-sm text-gray-400">全栈版</span>
         </div>
       </nav>
 
@@ -255,10 +343,19 @@ function App() {
             <p className="text-gray-500 text-lg max-w-lg mx-auto leading-relaxed">
               输入研究主题，AI自动检索PubMed文献并生成学术综述
             </p>
-            <p className="text-gray-400 text-sm mt-2">
-              后端版 · 数据持久化 · 支持真实DeepSeek AI
-            </p>
           </div>
+
+          {/* Backend notice */}
+          {showBackendNotice && (
+            <div className="w-full max-w-2xl mb-4">
+              <Alert className="bg-amber-50 border-amber-200">
+                <ServerOff className="w-4 h-4 text-amber-600" />
+                <AlertDescription className="text-amber-700 text-sm">
+                  后端服务未运行，已自动切换为前端直连模式（PubMed直接检索 + 本地综述生成）。功能正常使用。
+                </AlertDescription>
+              </Alert>
+            </div>
+          )}
 
           {/* Input */}
           <div className="w-full max-w-2xl">
@@ -549,7 +646,9 @@ function App() {
       <footer className="border-t border-gray-100 py-6 px-4">
         <div className="max-w-3xl mx-auto text-center text-sm text-gray-400 space-y-1">
           <p>文献数据来源于 PubMed 数据库 · 综述内容由 AI 辅助生成，仅供参考</p>
-          <p className="text-xs">后端驱动：tRPC + Drizzle ORM + Hono + MySQL</p>
+          <p className="text-xs">
+            {useBackend ? '后端模式：tRPC + DeepSeek AI' : '前端直连模式：PubMed + 本地生成'}
+          </p>
         </div>
       </footer>
     </div>

@@ -4,8 +4,81 @@ import { getDb } from "../queries/connection";
 import { searches, articles } from "@db/schema";
 import { eq } from "drizzle-orm";
 
-// PubMed API endpoints (backend direct call, no CORS)
+// PubMed API endpoints
 const PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+const PROXY_URL = "https://api.allorigins.win/raw?url=";
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 500; // ms
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch with retry and proxy fallback
+ */
+async function fetchWithRetry(
+  url: string,
+  options?: RequestInit,
+  retries: number = MAX_RETRIES
+): Promise<Response> {
+  let lastError: Error | undefined;
+
+  // Try direct request first
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, {
+        ...options,
+        headers: {
+          Accept: "application/json",
+          ...options?.headers,
+        },
+      });
+
+      // Check if response is actually JSON
+      const contentType = res.headers.get("content-type") || "";
+      if (contentType.includes("text/html")) {
+        const text = await res.text();
+        if (text.includes("DOCTYPE") || text.includes("<html")) {
+          throw new Error("PubMed returned HTML error page");
+        }
+        // If not actually HTML, continue
+      }
+
+      if (res.ok) return res;
+
+      // If rate limited, wait and retry
+      if (res.status === 429) {
+        await sleep(RETRY_DELAY * (i + 1));
+        continue;
+      }
+
+      throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      lastError = err as Error;
+      if (i < retries - 1) {
+        await sleep(RETRY_DELAY * (i + 1));
+      }
+    }
+  }
+
+  // Try with proxy as fallback
+  try {
+    const proxyUrl = `${PROXY_URL}${encodeURIComponent(url)}`;
+    const res = await fetch(proxyUrl, {
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...options?.headers,
+      },
+    });
+    if (res.ok) return res;
+    throw new Error(`Proxy HTTP ${res.status}`);
+  } catch {
+    throw lastError || new Error("All requests failed");
+  }
+}
 
 // PubMed article type
 export interface PubMedArticle {
@@ -22,10 +95,15 @@ export interface PubMedArticle {
 /**
  * Search PubMed and get PMID list
  */
-async function searchPubMedIds(keyword: string, maxResults: number = 15): Promise<string[]> {
-  const url = `${PUBMED_BASE}/esearch.fcgi?db=pubmed&term=${encodeURIComponent(keyword)}&retmax=${maxResults}&retmode=json&sort=relevance`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("PubMed search failed");
+async function searchPubMedIds(
+  keyword: string,
+  maxResults: number = 15
+): Promise<string[]> {
+  const url = `${PUBMED_BASE}/esearch.fcgi?db=pubmed&term=${encodeURIComponent(
+    keyword
+  )}&retmax=${maxResults}&retmode=json&sort=relevance`;
+
+  const res = await fetchWithRetry(url);
   const data = (await res.json()) as { esearchresult?: { idlist?: string[] } };
   return data.esearchresult?.idlist || [];
 }
@@ -33,12 +111,14 @@ async function searchPubMedIds(keyword: string, maxResults: number = 15): Promis
 /**
  * Get article details by PMID list
  */
-async function fetchArticleDetails(pmids: string[]): Promise<PubMedArticle[]> {
+async function fetchArticleDetails(
+  pmids: string[]
+): Promise<PubMedArticle[]> {
   if (pmids.length === 0) return [];
 
   const url = `${PUBMED_BASE}/esummary.fcgi?db=pubmed&id=${pmids.join(",")}&retmode=json`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("PubMed summary fetch failed");
+
+  const res = await fetchWithRetry(url);
   const data = (await res.json()) as {
     result?: Record<
       string,
@@ -77,30 +157,38 @@ async function fetchArticleDetails(pmids: string[]): Promise<PubMedArticle[]> {
 /**
  * Fetch abstracts for PMIDs
  */
-async function fetchAbstracts(pmids: string[]): Promise<Record<string, string>> {
+async function fetchAbstracts(
+  pmids: string[]
+): Promise<Record<string, string>> {
   if (pmids.length === 0) return {};
 
   const url = `${PUBMED_BASE}/efetch.fcgi?db=pubmed&id=${pmids.join(",")}&rettype=abstract`;
-  const res = await fetch(url);
-  if (!res.ok) return {};
 
-  const xmlText = await res.text();
-  const abstracts: Record<string, string> = {};
+  try {
+    const res = await fetchWithRetry(url);
+    const xmlText = await res.text();
+    const abstracts: Record<string, string> = {};
 
-  // Simple XML parsing to extract abstracts
-  const articleMatches = xmlText.matchAll(/<PubmedArticle>[\s\S]*?<\/PubmedArticle>/g);
-  for (const match of articleMatches) {
-    const articleXml = match[0];
-    const pmidMatch = articleXml.match(/<PMID[^>]*>(\d+)<\/PMID>/);
-    const pmid = pmidMatch ? pmidMatch[1] : "";
+    const articleMatches = xmlText.matchAll(
+      /<PubmedArticle>[\s\S]*?<\/PubmedArticle>/g
+    );
+    for (const match of articleMatches) {
+      const articleXml = match[0];
+      const pmidMatch = articleXml.match(/<PMID[^>]*>(\d+)<\/PMID>/);
+      const pmid = pmidMatch ? pmidMatch[1] : "";
 
-    const abstractMatch = articleXml.match(/<AbstractText[^>]*>([\s\S]*?)<\/AbstractText>/);
-    if (abstractMatch && pmid) {
-      abstracts[pmid] = abstractMatch[1].replace(/<[^>]+>/g, "");
+      const abstractMatch = articleXml.match(
+        /<AbstractText[^>]*>([\s\S]*?)<\/AbstractText>/
+      );
+      if (abstractMatch && pmid) {
+        abstracts[pmid] = abstractMatch[1].replace(/<[^>]+>/g, "");
+      }
     }
-  }
 
-  return abstracts;
+    return abstracts;
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -118,57 +206,69 @@ export const pubmedRouter = createRouter({
       })
     )
     .mutation(async ({ input }) => {
-      const { topic, maxResults } = input;
-
-      // 1. Search PubMed for PMIDs
-      const pmids = await searchPubMedIds(topic, maxResults);
-      if (pmids.length === 0) {
-        return { searchId: null, articles: [] };
-      }
-
-      // 2. Get article details
-      const articleDetails = await fetchArticleDetails(pmids);
-
-      // 3. Fetch abstracts (for first 10)
       try {
-        const abstracts = await fetchAbstracts(pmids.slice(0, 10));
-        articleDetails.forEach((a) => {
-          if (abstracts[a.pmid]) {
-            a.abstract = abstracts[a.pmid];
+        const { topic, maxResults } = input;
+
+        // 1. Search PubMed for PMIDs
+        const pmids = await searchPubMedIds(topic, maxResults);
+        if (pmids.length === 0) {
+          return { searchId: null, articles: [] };
+        }
+
+        // 2. Get article details
+        const articleDetails = await fetchArticleDetails(pmids);
+
+        // 3. Fetch abstracts (for first 10) with delay
+        if (pmids.length > 0) {
+          await sleep(300); // Rate limit compliance
+          try {
+            const abstracts = await fetchAbstracts(pmids.slice(0, 10));
+            articleDetails.forEach((a) => {
+              if (abstracts[a.pmid]) {
+                a.abstract = abstracts[a.pmid];
+              }
+            });
+          } catch {
+            // Abstracts are optional
           }
-        });
-      } catch {
-        // Abstracts are optional
-      }
+        }
 
-      // 4. Save to database
-      const db = getDb();
-      const [searchRecord] = await db.insert(searches).values({ topic }).$returningId();
-      const searchId = searchRecord.id;
+        // 4. Save to database
+        const db = getDb();
+        const [searchRecord] = await db
+          .insert(searches)
+          .values({ topic })
+          .$returningId();
+        const searchId = searchRecord.id;
 
-      // Insert articles
-      await db.insert(articles).values(
-        articleDetails.map((a) => ({
+        // Insert articles
+        await db.insert(articles).values(
+          articleDetails.map((a) => ({
+            searchId,
+            pmid: a.pmid,
+            title: a.title,
+            authors: JSON.stringify(a.authors),
+            journal: a.journal,
+            year: a.year,
+            abstract: a.abstract || null,
+            doi: a.doi || null,
+            url: a.url,
+            selected: true,
+          }))
+        );
+
+        return {
           searchId,
-          pmid: a.pmid,
-          title: a.title,
-          authors: JSON.stringify(a.authors),
-          journal: a.journal,
-          year: a.year,
-          abstract: a.abstract || null,
-          doi: a.doi || null,
-          url: a.url,
-          selected: true,
-        }))
-      );
-
-      return {
-        searchId,
-        articles: articleDetails.map((a) => ({
-          ...a,
-          uid: a.pmid, // compatibility with frontend
-        })),
-      };
+          articles: articleDetails.map((a) => ({
+            ...a,
+            uid: a.pmid,
+          })),
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Unknown error";
+        console.error("PubMed search error:", message);
+        throw new Error(`PubMed API 请求失败: ${message}，请稍后重试`);
+      }
     }),
 
   /**
@@ -201,7 +301,9 @@ export const pubmedRouter = createRouter({
    * Toggle article selection
    */
   toggleSelection: publicQuery
-    .input(z.object({ articleId: z.number(), selected: z.boolean() }))
+    .input(
+      z.object({ articleId: z.number(), selected: z.boolean() })
+    )
     .mutation(async ({ input }) => {
       const db = getDb();
       await db
