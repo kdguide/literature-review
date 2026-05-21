@@ -1,0 +1,16 @@
+# 文献综述助手 - Nixpacks 构建配置
+# Railway 使用此文件指导构建过程
+
+[phases.setup]
+# 安装 Node.js 20，并确保有编译原生模块的工具
+nixPkgs = ["nodejs_20", "python3", "gcc"]
+
+[phases.build]
+# 1. 安装所有依赖（包括 devDependencies）
+# 2. 构建前端（vite build）
+# 3. 构建后端（esbuild api/boot.ts → dist/boot.js）
+cmds = ["npm install", "npm run build"]
+
+[start]
+# 启动后端服务器
+cmd = "npm start"

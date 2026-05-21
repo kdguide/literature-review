@@ -1,8 +1,13 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
+  "$comment": "使用 Nixpacks 构建器，从源码构建",
+  "build": {
+    "builder": "NIXPACKS"
+  },
   "deploy": {
     "startCommand": "npm start",
     "healthcheckPath": "/api/trpc/ping",
-    "healthcheckTimeout": 30
+    "healthcheckTimeout": 30,
+    "restartPolicyType": "ON_FAILURE"
   }
 }
