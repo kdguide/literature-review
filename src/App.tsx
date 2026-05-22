@@ -69,8 +69,12 @@ function App() {
   const [editText, setEditText] = useState('');
   const [copied, setCopied] = useState(false);
   const [expandedAbstracts, setExpandedAbstracts] = useState<Set<string>>(new Set());
-  const [useBackend, setUseBackend] = useState(true); // true = try backend first
+  const [useBackend, setUseBackend] = useState(true);
   const [showBackendNotice, setShowBackendNotice] = useState(false);
+  // 筛选条件
+  const [yearFilter, setYearFilter] = useState<'all' | 'recent5'>('all');
+  const [ifFilter, setIfFilter] = useState<'all' | 'high5'>('all');
+  const [sortBy, setSortBy] = useState<'relevance' | 'date'>('relevance');
   const reviewRef = useRef<HTMLDivElement>(null);
 
   // tRPC mutations (backend)
@@ -107,6 +111,9 @@ function App() {
         const data = await searchMutation.mutateAsync({
           topic: topic.trim(),
           maxResults: 100,
+          yearFilter,
+          ifFilter,
+          sortBy,
         });
         if (data.searchId === null) {
           setError('未找到相关文献，请尝试更换关键词或检查拼写。');
@@ -385,6 +392,86 @@ function App() {
             </div>
           </div>
 
+          {/* 筛选条件 */}
+          <div className="w-full max-w-2xl mt-4">
+            <div className="flex flex-wrap items-center gap-3 justify-center">
+              {/* 年份筛选 */}
+              <div className="flex items-center gap-1.5 bg-gray-50 rounded-lg px-3 py-2">
+                <span className="text-sm text-gray-500">年份:</span>
+                <button
+                  onClick={() => setYearFilter('recent5')}
+                  className={`text-sm px-2.5 py-1 rounded-md transition-colors ${
+                    yearFilter === 'recent5'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-600 hover:bg-gray-200'
+                  }`}
+                >
+                  近5年
+                </button>
+                <button
+                  onClick={() => setYearFilter('all')}
+                  className={`text-sm px-2.5 py-1 rounded-md transition-colors ${
+                    yearFilter === 'all'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-600 hover:bg-gray-200'
+                  }`}
+                >
+                  全部
+                </button>
+              </div>
+
+              {/* 影响因子筛选 */}
+              <div className="flex items-center gap-1.5 bg-gray-50 rounded-lg px-3 py-2">
+                <span className="text-sm text-gray-500">期刊:</span>
+                <button
+                  onClick={() => setIfFilter('high5')}
+                  className={`text-sm px-2.5 py-1 rounded-md transition-colors ${
+                    ifFilter === 'high5'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-600 hover:bg-gray-200'
+                  }`}
+                >
+                  IF&gt;5
+                </button>
+                <button
+                  onClick={() => setIfFilter('all')}
+                  className={`text-sm px-2.5 py-1 rounded-md transition-colors ${
+                    ifFilter === 'all'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-600 hover:bg-gray-200'
+                  }`}
+                >
+                  全部
+                </button>
+              </div>
+
+              {/* 排序方式 */}
+              <div className="flex items-center gap-1.5 bg-gray-50 rounded-lg px-3 py-2">
+                <span className="text-sm text-gray-500">排序:</span>
+                <button
+                  onClick={() => setSortBy('date')}
+                  className={`text-sm px-2.5 py-1 rounded-md transition-colors ${
+                    sortBy === 'date'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-600 hover:bg-gray-200'
+                  }`}
+                >
+                  由新到旧
+                </button>
+                <button
+                  onClick={() => setSortBy('relevance')}
+                  className={`text-sm px-2.5 py-1 rounded-md transition-colors ${
+                    sortBy === 'relevance'
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-600 hover:bg-gray-200'
+                  }`}
+                >
+                  相关性
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* Quick topics */}
           {appState === 'idle' && (
             <div className="mt-8 flex flex-wrap gap-2 justify-center max-w-lg">
@@ -494,11 +581,16 @@ function App() {
                               <ExternalLink className="w-3 h-3 inline ml-1 opacity-50" />
                             </h3>
 
-                            <p className="text-sm text-gray-500 mb-2">
+                            <p className="text-sm text-gray-500 mb-2 flex items-center gap-1 flex-wrap">
                               {article.authors.length > 0 ? `${article.authors.join(', ')} 等 · ` : ''}
                               <span className="text-gray-600">{article.journal}</span>
                               {' · '}
                               <span className="text-gray-400">{article.year}</span>
+                              {(article as Article & { highIF?: boolean }).highIF && (
+                                <span className="ml-1 px-1.5 py-0.5 text-xs bg-amber-50 text-amber-600 rounded-full font-medium">
+                                  IF&gt;5
+                                </span>
+                              )}
                             </p>
 
                             {article.abstract && (
@@ -567,7 +659,7 @@ function App() {
                   )}
                 </div>
                 <h1 className="text-2xl font-bold text-[#1A1A2E] leading-snug">
-                  {review.title}
+                  {review.title.replace(/^##\s*/, '')}
                 </h1>
               </div>
 
@@ -616,10 +708,10 @@ function App() {
                   {review.sections.map((section, i) => (
                     <div key={i}>
                       <h3 className="text-lg font-semibold text-[#1A1A2E] mb-3">
-                        {section.title}
+                        {section.title.replace(/^##\s*/, '')}
                       </h3>
                       <div className="text-gray-700 leading-relaxed whitespace-pre-line">
-                        {section.content}
+                        {section.content.replace(/每篇综述约[\d.]+元/g, '').replace(/费用[:：][\s\S]*?元/g, '').replace(/##\s*/g, '')}
                       </div>
                     </div>
                   ))}
@@ -629,8 +721,7 @@ function App() {
                     <ol className="space-y-2">
                       {review.references.map((ref, i) => (
                         <li key={i} className="text-sm text-gray-600 leading-relaxed pl-2">
-                          <span className="text-blue-600 font-medium mr-1">[{i + 1}]</span>
-                          {ref.replace(/^\[\d+\]\s*/, '')}
+                          {ref.replace(/^\[\d+\]\s*/, '').replace(/^\$\d+\s*/, '')}
                         </li>
                       ))}
                     </ol>

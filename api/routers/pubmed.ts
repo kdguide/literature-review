@@ -11,8 +11,71 @@ const PROXY_URL = "https://api.allorigins.win/raw?url=";
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 500; // ms
 
+// 常见高影响因子期刊映射（IF > 5）
+const HIGH_IF_JOURNALS = new Set([
+  "nature", "science", "cell", "lancet", "jama", "bmj", "nejm",
+  "new england journal of medicine", "nature medicine", "nature reviews",
+  "cancer cell", "cancer discovery", "lancet oncology",
+  "journal of clinical oncology", "annals of oncology",
+  "journal of clinical investigation", "pnas", "blood",
+  "gut", "hepatology", "circulation", "journal of the american college of cardiology",
+  "european heart journal", "diabetes", "diabetes care",
+  "allergy", "journal of allergy and clinical immunology",
+  "immunity", "nature immunology", "journal of experimental medicine",
+  "molecular cell", "cell metabolism", "developmental cell",
+  "nature cell biology", "cell stem cell", "nature neuroscience",
+  "brain", "nature genetics", "genome research", "nature reviews genetics",
+  "nature reviews molecular cell biology", "nature reviews cancer",
+  "annual review of", "trends in", "current opinion in",
+  "european urology", "journal of hepatology",
+  "gastroenterology", "journal of clinical pathology",
+  "journal of the national cancer institute",
+  "british journal of cancer", "oncogene",
+  "clinical cancer research", "international journal of cancer",
+  "radiotherapy and oncology", "journal of thoracic oncology",
+  "lung cancer", "journal of clinical endocrinology and metabolism",
+  "thyroid", "osteoporosis international",
+  "arthritis and rheumatology", "annals of the rheumatic diseases",
+  "journal of bone and mineral research", "stroke",
+  "neurology", "alzheimers and dementia",
+  "journal of pediatrics", "pediatrics",
+  "obstetrics and gynecology", "fertility and sterility",
+  "human reproduction", "american journal of obstetrics and gynecology",
+  "intensive care medicine", "critical care medicine",
+  "journal of the american society of nephrology",
+  "kidney international", "hypertension",
+  "journal of bone and joint surgery", "spine",
+  "american journal of respiratory and critical care medicine",
+  "chest", "journal of infectious diseases",
+  "clinical infectious diseases", "cid",
+  "antimicrobial agents and chemotherapy",
+  "frontiers in immunology", "frontiers in oncology",
+  "international journal of molecular sciences",
+  "theranostics", "nano today",
+  "small", "acs nano", "advanced materials",
+  "advanced functional materials", "advanced science",
+  "biomaterials", "acta biomaterialia",
+  "nature communications", "science advances",
+  "cell reports", "elife", "plos biology",
+  "journal of medicinal chemistry", "drug discovery today",
+]);
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Check if a journal has high impact factor (>5)
+ */
+function hasHighIF(journal: string): boolean {
+  const lower = journal.toLowerCase();
+  // Direct match in set
+  if (HIGH_IF_JOURNALS.has(lower)) return true;
+  // Check if any high IF journal name is included
+  for (const hj of HIGH_IF_JOURNALS) {
+    if (lower.includes(hj)) return true;
+  }
+  return false;
 }
 
 /**
@@ -25,7 +88,6 @@ async function fetchWithRetry(
 ): Promise<Response> {
   let lastError: Error | undefined;
 
-  // Try direct request first
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
@@ -36,19 +98,16 @@ async function fetchWithRetry(
         },
       });
 
-      // Check if response is actually JSON
       const contentType = res.headers.get("content-type") || "";
       if (contentType.includes("text/html")) {
         const text = await res.text();
         if (text.includes("DOCTYPE") || text.includes("<html")) {
           throw new Error("PubMed returned HTML error page");
         }
-        // If not actually HTML, continue
       }
 
       if (res.ok) return res;
 
-      // If rate limited, wait and retry
       if (res.status === 429) {
         await sleep(RETRY_DELAY * (i + 1));
         continue;
@@ -90,18 +149,34 @@ export interface PubMedArticle {
   abstract: string;
   doi: string;
   url: string;
+  highIF?: boolean;
 }
 
 /**
- * Search PubMed and get PMID list
+ * Search PubMed and get PMID list with filters
  */
 async function searchPubMedIds(
   keyword: string,
-  maxResults: number = 100
+  maxResults: number = 100,
+  yearFilter: string = "all",
+  sortBy: string = "relevance"
 ): Promise<string[]> {
+  // Build date filter
+  let dateParams = "";
+  if (yearFilter === "recent5") {
+    const now = new Date();
+    const fiveYearsAgo = new Date(now.getFullYear() - 5, 0, 1);
+    const mindate = `${fiveYearsAgo.getFullYear()}/01/01`;
+    const maxdate = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, "0")}/${String(now.getDate()).padStart(2, "0")}`;
+    dateParams = `&mindate=${encodeURIComponent(mindate)}&maxdate=${encodeURIComponent(maxdate)}`;
+  }
+
+  // Build sort
+  const sortParam = sortBy === "date" ? "&sort=pub+date" : "&sort=relevance";
+
   const url = `${PUBMED_BASE}/esearch.fcgi?db=pubmed&term=${encodeURIComponent(
     keyword
-  )}&retmax=${maxResults}&retmode=json&sort=relevance`;
+  )}&retmax=${maxResults}${dateParams}${sortParam}&retmode=json`;
 
   const res = await fetchWithRetry(url);
   const data = (await res.json()) as { esearchresult?: { idlist?: string[] } };
@@ -138,17 +213,19 @@ async function fetchArticleDetails(
     .map((pmid) => {
       const article = result?.[pmid];
       if (!article) return null;
+      const journal = article.fulljournalname || article.source || "未知期刊";
       return {
         pmid,
         title: article.title || "无标题",
         authors: (article.authors || [])
           .map((a: { name: string }) => a.name)
           .slice(0, 6),
-        journal: article.fulljournalname || article.source || "未知期刊",
+        journal,
         year: article.pubdate ? article.pubdate.substring(0, 4) : "未知年份",
         abstract: "",
         doi: article.elocationid || "",
         url: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`,
+        highIF: hasHighIF(journal),
       };
     })
     .filter((a): a is PubMedArticle => a !== null);
@@ -203,26 +280,36 @@ export const pubmedRouter = createRouter({
       z.object({
         topic: z.string().min(1).max(500),
         maxResults: z.number().min(1).max(100).optional().default(100),
+        yearFilter: z.enum(["all", "recent5"]).optional().default("all"),
+        ifFilter: z.enum(["all", "high5"]).optional().default("all"),
+        sortBy: z.enum(["relevance", "date"]).optional().default("relevance"),
       })
     )
     .mutation(async ({ input }) => {
       try {
-        const { topic, maxResults } = input;
+        const { topic, maxResults, yearFilter, ifFilter, sortBy } = input;
 
-        // 1. Search PubMed for PMIDs
-        const pmids = await searchPubMedIds(topic, maxResults);
+        // 1. Search PubMed for PMIDs with filters
+        let pmids = await searchPubMedIds(topic, maxResults, yearFilter, sortBy);
         if (pmids.length === 0) {
           return { searchId: null, articles: [] };
         }
 
         // 2. Get article details
-        const articleDetails = await fetchArticleDetails(pmids);
+        let articleDetails = await fetchArticleDetails(pmids);
 
-        // 3. Fetch abstracts (for first 10) with delay
-        if (pmids.length > 0) {
-          await sleep(300); // Rate limit compliance
+        // 3. Filter by impact factor (high5 = IF > 5)
+        if (ifFilter === "high5") {
+          articleDetails = articleDetails.filter((a) => a.highIF);
+        }
+
+        // 4. Fetch abstracts (for first 10) with delay
+        if (articleDetails.length > 0) {
+          await sleep(300);
           try {
-            const abstracts = await fetchAbstracts(pmids.slice(0, 10));
+            const abstracts = await fetchAbstracts(
+              articleDetails.slice(0, 10).map((a) => a.pmid)
+            );
             articleDetails.forEach((a) => {
               if (abstracts[a.pmid]) {
                 a.abstract = abstracts[a.pmid];
@@ -233,7 +320,7 @@ export const pubmedRouter = createRouter({
           }
         }
 
-        // 4. Save to database
+        // 5. Save to database
         const db = getDb();
         const searchResult = await db
           .insert(searches)
